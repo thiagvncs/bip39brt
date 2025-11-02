@@ -1,0 +1,179 @@
+import time
+import numpy as np
+import pyopencl as cl
+from mnemonic import Mnemonic
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import time
+import hashlib
+import hmac
+seed_hex = "db4c5960c73d510cfd34c8ccbab2058b893e2a6c2af88140982e4f1d028fc6a56ba3e48738fca465cd5014a41169558ea8360ca1d8336fc6e5b946e3e0fdf012"
+
+# Converter a seed para bytes
+seed_bytes = bytes.fromhex(seed_hex)
+
+# Chave "Bitcoin seed" como bytes
+key = b"Bitcoin seed"
+
+# Calcular HMAC-SHA512
+hmac_result = hmac.new(key, seed_bytes, hashlib.sha512).digest()
+
+# Separar em Master Private Key e Chain Code
+master_private_key = hmac_result[:32].hex()
+chain_code = hmac_result[32:].hex()
+
+# Mostrar os resultados
+print(f"Em Python pegando o HMAC-SHA512 Result em HEX: {hmac_result.hex()}")
+
+
+# Converter 
+import os
+os.environ['PYOPENCL_COMPILER_OUTPUT'] = '1'
+import random
+
+BIP32_E8_ID = 1;
+BIP39_EIGHT_LEN = [
+    'bexiga', 'curativo', 'neblina', 'nevoeiro', 'bonde', 'reter',
+    'abutre', 'corvo', 'urubu', 'megafone', 'falar', 'haste', 'global', 'englobar',
+    'pilastra', 'sentado', 'pouso', 'reter',
+    'livro', 'leitura', 'mulher', 'jogador', 'amarelo', 'colher', 'futebol',
+    'cozinha', 'espanto', 'rosto', 'camisa', 'branco', 'senador', 'gaveta', 'reter'
+]
+
+mnemo = Mnemonic("portuguese")
+
+FIXED_WORDS = ['bexiga', 'curativo', 'bonde', 'megafone'] + ['reter'] * 8
+print(FIXED_WORDS)
+DESTINY_WALLET = "1CfntEjWHwCc7moXnMHUX8QuBJaakAnv8U"
+
+
+repeater_workers = 1
+local_workers = 256
+global_workers = 512
+
+global_workers -= global_workers%local_workers
+tw = (global_workers,)
+tt = (local_workers,)
+
+
+print(f"Rodando OpenCL com {global_workers} GPU THREADS e {repeater_workers * global_workers}")
+
+
+    
+def run_kernel(program, queue):
+    context = program.context
+    kernel = program.verify
+    elements = global_workers * 12000
+    bytes = elements * 8
+    inicio = time.perf_counter()
+    indices = words_to_indices(FIXED_WORDS)
+    print(indices)
+    high, low = mnemonic_to_uint64_pair(indices)
+    print(high,low)
+    high_buf = cl.Buffer(context, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=np.array([high], dtype=np.uint64))
+    low_buf = cl.Buffer(context, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=np.array([low], dtype=np.uint64))
+    p = cl.Buffer(context, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=np.array([1], dtype=np.uint32))
+
+ 
+    output_buf = cl.Buffer(context, cl.mem_flags.WRITE_ONLY, bytes)
+    kernel.set_args(p, high_buf, low_buf, output_buf)
+    
+    event = cl.enqueue_nd_range_kernel(queue, kernel, tw, tt)
+    
+    event.wait()
+    start_time = event.profile.start
+    end_time = event.profile.end
+    execution_time = (end_time - start_time) * 1e-6  # Em milissegundos
+    print(f"Tempo de execução do kernel: {execution_time:.3f} ms")
+    resultado = (global_workers) / (time.perf_counter() - inicio)
+    result = np.empty(elements, dtype=np.uint64) 
+    cl.enqueue_copy(queue, result, output_buf).wait()
+
+    print(f"Tempo de execução: {resultado:.2f} por seguno")
+
+
+def carregar_wallets():
+    memoria = {}
+    print("Carregando endereços Bitcoin na Memória")
+    with open("wallets.tsv", "r") as arquivo:
+        for linha in arquivo:
+            linha = linha.strip()
+            if linha:
+                try:
+                    addr, saldo = linha.split()
+                    memoria[addr] = float(saldo)
+                except ValueError:
+                    continue
+
+    addr_busca = "0x1234abcd"
+    if addr_busca in memoria:
+        print(f"Saldo de {addr_busca}: {memoria[addr_busca]}")
+    else:
+        print(f"Endereço {addr_busca} não encontrado.")
+
+
+def build_program(context, *filenames):
+    source_code = ""
+    for filename in filenames:
+        source_code += load_program_source(filename) + "\n\n\n"
+    return cl.Program(context, source_code).build()
+
+
+def words_to_indices(words):
+    indices = []
+    for word in words:
+        if word in mnemo.wordlist:
+            indices.append(mnemo.wordlist.index(word))
+    return np.array(indices, dtype=np.int32)
+
+
+def mnemonic_to_uint64_pair(indices): 
+    binary_string = ''.join(f"{index:011b}" for index in indices)[:-4]
+    binary_string = binary_string.ljust(128, '0')
+    high = int(binary_string[:64], 2)
+    low = int(binary_string[64:], 2)
+    return high, low
+  
+ 
+def uint64_pair_to_mnemonic(high, low):
+    binary_string = f"{high:064b}{low:064b}"
+    indices = [int(binary_string[i:i+11], 2)
+               for i in range(0, len(binary_string), 11)]
+    words = [mnemo.wordlist[index]
+             for index in indices if index < len(mnemo.wordlist)]
+    seed = ' '.join(words)
+    return seed
+
+
+def main():
+    try:
+        platforms = cl.get_platforms()
+        devices = platforms[0].get_devices()
+        device = devices[0]
+
+        context = cl.Context([device])
+        queue = cl.CommandQueue(context, properties=cl.command_queue_properties.PROFILING_ENABLE)
+
+        program = build_program(context,"./kernel/main.cl")
+        if not (device.queue_properties & cl.command_queue_properties.PROFILING_ENABLE):
+            print("O dispositivo não suporta perfilamento!")
+        else:
+            print("Perfilamento habilitado.")
+        run_kernel(program, queue)
+
+        print("Kernel executado com sucesso.")
+    except Exception as e:
+        print(f"Erro ao compilar o programa OpenCL 1: {e}")
+    return
+
+
+def load_program_source(filename):
+    with open(filename, 'r') as f:
+        content = f.read()
+    return content
+
+
+
+if __name__ == "__main__":
+    #carregar_wallets()
+    main()
